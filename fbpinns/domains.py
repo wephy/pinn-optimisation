@@ -190,7 +190,3 @@ if __name__ == "__main__":
         print(x_batch.shape)
         plt.scatter(x_batch[:,0], x_batch[:,1])
     plt.show()
-
-
-
-

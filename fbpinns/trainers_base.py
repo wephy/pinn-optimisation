@@ -26,7 +26,7 @@ class _Trainer:
 
         # clear directories
         c.get_outdirs()
-        c.save_constants_file()
+        # c.save_constants_file()
         logger.info(c)
 
         # initialise summary writer
@@ -38,7 +38,7 @@ class _Trainer:
     def _print_summary(self, i, loss, rate, start):
         "Prints training summary"
 
-        logger.info("[i: %i/%i] loss: %.4f rate: %.1f elapsed: %.2f hr %s" % (
+        logger.info("[i: %i/%i] loss: %.5f rate: %.1f elapsed: %.2f hr %s" % (
                i,
                self.c.n_steps,
                loss,

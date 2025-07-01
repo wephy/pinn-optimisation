@@ -341,6 +341,162 @@ class BurgersEquation2D(Problem):
         return u
 
 
+from scipy.integrate import solve_ivp
+from scipy.interpolate import RegularGridInterpolator
+
+
+class AllenCahnEquation2D(Problem):
+    """
+    Solves the time-dependent 1D Allen-Cahn equation and provides a
+    high-fidelity numerical solution for comparison.
+
+        du     d^2 u
+        -- = e * ----- + u * (1 - u^2)
+        dt     dx^2
+
+        for -1.0 < x < +1.0, and 0 < t
+
+    Initial Condition:
+        u(x,0) = x^2 * cos(pi*x)
+    
+    Boundary Conditions:
+        Periodic on x.
+    """
+
+    # Class-level cache for the high-fidelity solver's interpolator object.
+    # This prevents re-running the slow numerical solver every time.
+    _solver_interpolator = None
+
+    @staticmethod
+    def init_params(epsilon=1e-4, kappa=5.0, sd=0.1, N_solver=512, t_max_solver=1.0):
+        """
+        Initializes the static parameters for the problem.
+
+        Args:
+            epsilon (float): Parameter for the Allen-Cahn equation.
+            kappa (float): Parameter for the reaction term in the Allen-Cahn equation.
+            sd (float): Scaling factor for the constraining function.
+            N_solver (int): Number of spatial points for the numerical ground truth solver.
+            t_max_solver (float): Maximum time for the numerical ground truth solver.
+        """
+        static_params = {
+            "dims": (1, 2),
+            "epsilon": epsilon,
+            "kappa": kappa,  # Added kappa parameter
+            "sd": sd,
+            "N_solver": N_solver,
+            "t_max_solver": t_max_solver,
+        }
+        return static_params, {}
+
+    @staticmethod
+    def sample_constraints(all_params, domain, key, sampler, batch_shapes):
+        """Samples points in the domain to enforce the physics."""
+        # Physics loss points
+        x_batch_phys = domain.sample_interior(all_params, key, sampler, batch_shapes[0])
+        required_ujs_phys = (
+            (0, ()),      # u
+            (0, (1,)),    # du/dt
+            (0, (0, 0)),  # d²u/dx²
+        )
+        return [[x_batch_phys, required_ujs_phys],]
+
+    @staticmethod
+    def constraining_fn(all_params, x_batch, u):
+        """Applies hard constraints for initial conditions."""
+        sd = all_params["static"]["problem"]["sd"]
+        x, t = x_batch[:, 0:1], x_batch[:, 1:2]
+        sin, tanh, pi = jnp.sin,jax.nn.tanh, jnp.pi
+        
+        # Enforce the initial condition u(x,0) = x^2 * sin(2*pi*x)
+        initial_condition = x**2 * sin(2 * pi * x)
+        # Use a smooth tanh function to fade from the initial condition at t=0
+        # to the neural network solution for t>0.
+        u = tanh((x+1)/sd) * tanh((1-x)/sd) * tanh(t / sd) * u + (1 - jax.nn.tanh(t / sd)) * initial_condition
+        return u
+
+    @staticmethod
+    def loss_fn(all_params, constraints):
+        """Computes the physics-informed loss from the Allen-Cahn residual."""
+        problem_params = all_params["static"]["problem"]
+        epsilon = problem_params["epsilon"]
+        kappa = problem_params["kappa"] # Use kappa from params
+        _, u, ut, uxx = constraints[0]
+        
+        # Allen-Cahn equation residual: f = du/dt - epsilon*d^2u/dx^2 + kappa*(u^3 - u)
+        f = ut - epsilon * uxx + kappa * (u**3 - u)
+        
+        # Return the mean squared error of the residual
+        return jnp.mean(f**2)
+
+    @staticmethod
+    def _allen_cahn_rhs(t, u, epsilon, kappa, dx):
+        """Helper function for the numerical ODE solver (Method of Lines)."""
+        # Enforce periodic boundaries using np.roll
+        u_left = np.roll(u, 1)
+        u_right = np.roll(u, -1)
+        laplacian = (u_left - 2 * u + u_right) / dx**2
+        
+        # ### CORRECTED REACTION TERM ###
+        # The equation is du/dt - ε*uxx + κ*(u³-u) = 0
+        # So, du/dt = ε*uxx - κ*(u³-u)
+        reaction = -kappa * (u**3 - u)
+        return epsilon * laplacian + reaction
+
+    @classmethod
+    def exact_solution(cls, all_params, x_batch, batch_shape):
+        """
+        Provides a high-fidelity numerical solution to the Allen-Cahn equation.
+
+        This method uses the Method of Lines and a high-quality ODE solver
+        (scipy.integrate.solve_ivp) to compute a benchmark solution. The result
+        is cached and interpolated to avoid re-computation.
+        """
+        # --- Caching Mechanism ---
+        if cls._solver_interpolator is None:
+            logger.info("No cached solution found. Running high-fidelity numerical solver...")
+            
+            problem_params = all_params["static"]["problem"]
+            epsilon = problem_params["epsilon"]
+            kappa = problem_params["kappa"]
+            N = problem_params["N_solver"]
+            t_max = problem_params["t_max_solver"]
+            
+            L = 2.0
+            dx = L / N
+            x_grid = np.linspace(-1.0, 1.0, N, endpoint=False)
+            t_grid = np.linspace(0, t_max, int(t_max * 100) + 1)
+            
+            # Set the initial condition on the grid
+            u0 = x_grid**2 * np.sin(2 * np.pi * x_grid)
+            
+            # Solve the system of ODEs
+            sol = solve_ivp(
+                fun=cls._allen_cahn_rhs,
+                t_span=(0, t_max),
+                y0=u0,
+                t_eval=t_grid,
+                method='BDF', # 'BDF' is good for stiff equations
+                args=(epsilon, kappa, dx) # Pass kappa to the solver
+            )
+            
+            u_solution_grid = sol.y.T
+            
+            logger.info("Solver finished. Caching the solution interpolator.")
+            cls._solver_interpolator = RegularGridInterpolator(
+                (t_grid, x_grid), u_solution_grid,
+                bounds_error=False, fill_value=None
+            )
+        else:
+            logger.info("Using cached high-fidelity solution.")
+            
+        # --- Interpolation ---
+        x_coords = x_batch[:, 0]
+        t_coords = x_batch[:, 1]
+        points_to_interpolate = jnp.hstack([t_coords[:, None], x_coords[:, None]])
+        u_exact = cls._solver_interpolator(points_to_interpolate)
+        
+        return jnp.array(u_exact).reshape((-1, 1))
 
 
 class WaveEquationConstantVelocity3D(Problem):

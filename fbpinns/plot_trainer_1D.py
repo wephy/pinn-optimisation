@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 
 from fbpinns.util.other import colors
 
+from functools import wraps
+
 def _lim(v, factor=1.1):
     mi, ma = v.min(0), v.max(0)
     c = (mi+ma)/2
@@ -22,11 +24,25 @@ def _plot_setup(x_batch_test, u_exact):
     xlim, ulim = _lim(x_batch_test), _lim(u_exact)
     return xlim, ulim
 
-def _to_numpy(f):
-    # converts jnp arrays to np arrays
-    def wrapper(*args):
-        args = jax.tree_util.tree_map(lambda a: np.array(a) if isinstance(a, jnp.ndarray) else a, args)
-        return f(*args)
+def _to_numpy(fn):
+    """
+    Decorator that converts all JAX array arguments (in *args and **kwargs) 
+    to NumPy arrays before calling the decorated function.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Define the conversion function
+        def convert(x):
+            if isinstance(x, jnp.ndarray):
+                return np.array(x)
+            return x
+
+        # Convert all JAX arrays in positional and keyword arguments
+        args_np = jax.tree_util.tree_map(convert, args)
+        kwargs_np = jax.tree_util.tree_map(convert, kwargs)
+        
+        # Call the original function with the converted arguments
+        return fn(*args_np, **kwargs_np)
     return wrapper
 
 @_to_numpy

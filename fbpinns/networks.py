@@ -9,6 +9,7 @@ This module is used by constants.py (and subsequently trainers.py)
 
 import jax.numpy as jnp
 from jax import random
+from jax.nn import relu
 
 
 class Network:
@@ -63,6 +64,7 @@ class FCN(Network):
         for w, b in params[:-1]:
             x = jnp.dot(w, x) + b
             x = jnp.tanh(x)
+            # x = relu(x)
         w, b = params[-1]
         x = jnp.dot(w, x) + b
         return x

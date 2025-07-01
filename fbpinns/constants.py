@@ -63,8 +63,7 @@ class Constants(ConstantsBase):
             layer_sizes=[1, 32, 1],
             )
 
-        # Define scheduler
-        self.n_steps = 15000
+        # Define subdomain scheduler
         self.scheduler = schedulers.AllActiveSchedulerND
         self.scheduler_kwargs = dict()
         #self.scheduler = schedulers.PointSchedulerRectangularND
@@ -75,12 +74,12 @@ class Constants(ConstantsBase):
         # Define optimisation parameters
         self.ns = ((60,),)# batch_shape for each training constraint
         self.n_test = (200,)# batch_shape for test data
-        self.sampler = "grid"# one of ["grid", "uniform", "sobol", "halton"]
-        self.optimiser = optax.adam
-        self.optimiser_kwargs = dict(
-            learning_rate=1e-3
-            )
+        self.sampler = "grid"# JAX uniform sampler is recommended for on-the-fly generation
         self.seed = 0
+
+        # self.n_batches = 1 # Deprecated when resample_every_step is True
+        # self.resample_every_step = False # If True, generates new collocation points at each training step.
+        # self.resample_frequency = 1e10 # Set how often to resample points (e.g., 1 = every step, 50 = every 50 steps).
 
         # Define summary output parameters
         self.summary_freq    = 1000# outputs train stats to command line
@@ -93,9 +92,22 @@ class Constants(ConstantsBase):
         # other constants
         self.hostname = socket.gethostname().lower()
 
+        # --- NEW: Optimiser Schedule ---
+        # Format: [(optimiser_class, num_steps, kwargs_dict), ...]
+        self.optimiser_schedule = [
+            (optax.adam, 15000, dict(learning_rate=1e-3)),
+            ]
+        
+        # Total number of steps is derived from the schedule
+        self.n_steps = sum(item[1] for item in self.optimiser_schedule)
+
+
         # overwrite with input arguments
         for key in kwargs.keys(): self[key] = kwargs[key]# invokes __setitem__ in ConstantsBase
-
+        
+        # Recalculate n_steps if schedule was overwritten
+        if "optimiser_schedule" in kwargs:
+            self.n_steps = sum(item[1] for item in self.optimiser_schedule)
 
 
 if __name__ == "__main__":
@@ -105,5 +117,3 @@ if __name__ == "__main__":
 
     c.get_outdirs()
     c.save_constants_file()
-
-

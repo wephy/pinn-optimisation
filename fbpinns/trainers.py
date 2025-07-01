@@ -289,9 +289,22 @@ def FBPINN_update(optimiser_fn, active_opt_states,
     # recombine static params
     static_params = combine(static_params_dynamic, static_params_static)
     # update step
-    lossval, grads = value_and_grad(FBPINN_loss, argnums=0)(
-        active_params, fixed_params, static_params, takess, constraints, model_fns, jmapss, loss_fn)
-    updates, active_opt_states = optimiser_fn(grads, active_opt_states, active_params)
+    # lossval, grads = value_and_grad(FBPINN_loss, argnums=0)(
+    #     active_params, fixed_params, static_params, takess, constraints, model_fns, jmapss, loss_fn)
+    # updates, active_opt_states = optimiser_fn(grads, active_opt_states, active_params)
+    
+    def _value_fn(p):
+        return FBPINN_loss(p, fixed_params, static_params, takess, constraints, model_fns, jmapss, loss_fn)
+    
+    lossval, grads = value_and_grad(_value_fn, argnums=0)(active_params)
+    
+    updates, active_opt_states = optimiser_fn(
+        grads, active_opt_states, active_params,
+        value=lossval,
+        grad=grads,
+        value_fn=_value_fn
+    )
+    
     active_params = optax.apply_updates(active_params, updates)
     return lossval, active_opt_states, active_params
 
@@ -427,11 +440,12 @@ def _common_train_initialisation(c, key, all_params, problem, domain):
         logger.info(f'\t{k}: {total_size(all_params["trainable"][k]):,}')
 
     # initialise optimiser
-    optimiser = optax.adam(**c.optimiser_kwargs)
-    all_opt_states = optimiser.init(all_params["trainable"])
-    logger.debug("all_opt_states")
-    logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), all_opt_states))
-    optimiser_fn, loss_fn = optimiser.update, problem.loss_fn
+    # optimiser = optax.adam(learning_rate=1e-3)
+    # all_opt_states = optimiser.init(all_params["trainable"])
+    # logger.debug("all_opt_states")
+    # logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), all_opt_states))
+    # optimiser_fn, loss_fn = optimiser.update, problem.loss_fn
+    loss_fn = problem.loss_fn
 
     # get global constraints (training points)
     key, subkey = random.split(key)
@@ -472,7 +486,7 @@ def _common_train_initialisation(c, key, all_params, problem, domain):
     logger.debug("u_exact")
     logger.debug(str_tensor(u_exact))
 
-    return (optimiser, all_opt_states, optimiser_fn, loss_fn, key,
+    return (loss_fn, key,
             constraints_global, x_batch_global, constraint_offsets_global, constraint_fs_global, jmapss,
             x_batch_test, u_exact)
 
@@ -506,7 +520,7 @@ class FBPINNTrainer(_Trainer):
 
         return x_batch, constraints, constraint_fs, constraint_ips
 
-    def _get_update_inputs(self, i, active, all_params, all_opt_states, x_batch_global, constraints_global, constraint_fs_global, constraint_offsets_global, decomposition, problem):
+    def _get_update_inputs(self, i, active, all_params, x_batch_global, constraints_global, constraint_fs_global, constraint_offsets_global, decomposition, problem):
         "Get inputs to the FBPINN update step based on active models"
 
         start0 = time.time()
@@ -528,15 +542,15 @@ class FBPINNTrainer(_Trainer):
         active_params = cut_active(all_params["trainable"])
         fixed_params = cut_fixed(all_params["trainable"])
         static_params = cut_all(all_params["static"])
-        active_opt_states = tree_map_dicts(cut_active, all_opt_states)# because all_opt_states has more complex structure
+        # active_opt_states = tree_map_dicts(cut_active, all_opt_states)# because all_opt_states has more complex structure
         logger.debug("active_params")
         logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), active_params))
         logger.debug("fixed_params")
         logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), fixed_params))
         logger.debug("static_params")
         logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), static_params))
-        logger.debug("active_opt_states")
-        logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), active_opt_states))
+        # logger.debug("active_opt_states")
+        # logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), active_opt_states))
 
         # split takes into many using constraint_ips (multiple constraints)
         # choice 1: use serial constraints - to stop too many gradients
@@ -572,7 +586,14 @@ class FBPINNTrainer(_Trainer):
 
         logger.info(f"[i: {i}/{self.c.n_steps}] Updating active inputs done ({time.time()-start0:.2f} s)")
 
-        return active, merge_active, active_opt_states, active_params, fixed_params, static_params, takess, constraints, x_batch
+        return active, merge_active, active_params, fixed_params, static_params, takess, constraints, x_batch
+
+    def _get_current_stage(self, i):
+        """Helper to find the optimiser stage index for a given step i."""
+        optimiser_schedule = self.c.optimiser_schedule
+        stage_boundaries = np.cumsum([s[1] for s in optimiser_schedule])
+        stage_idx = np.searchsorted(stage_boundaries, i, side='right')
+        return stage_idx
 
     def train(self):
         "Train model"
@@ -612,8 +633,14 @@ class FBPINNTrainer(_Trainer):
         # initialise scheduler
         scheduler = c.scheduler(all_params=all_params, n_steps=c.n_steps, **c.scheduler_kwargs)
 
+        optimiser_schedule = c.optimiser_schedule
+        stage_boundaries = np.cumsum([s[1] for s in optimiser_schedule])
+        current_stage = -1
+        optimiser_fn = None
+        # all_opt_states = None
+
         # common initialisation
-        (optimiser, all_opt_states, optimiser_fn, loss_fn, key,
+        (loss_fn, key,
         constraints_global, x_batch_global, constraint_offsets_global, constraint_fs_global, jmapss,
         x_batch_test, u_exact) = _common_train_initialisation(c, key, all_params, problem, domain)
 
@@ -624,32 +651,53 @@ class FBPINNTrainer(_Trainer):
         test_inputs = (takes_, all_ims_, cut_all_)
 
         # train loop
-        pstep, fstep, u_test_losses = 0, 0, []
+        # pstep, fstep, u_test_losses = 0, 0, []
+        pstep, fstep, train_loss_history, test_error_history = 0, 0, [], []
+        
         start0, start1, report_time = time.time(), time.time(), 0.
         merge_active, active_params, active_opt_states, fixed_params = None, None, None, None
         lossval = None
+        
         for i,active_ in enumerate(scheduler):
 
             # update active
             if active_ is not None:
                 active = active_
-
-                # first merge latest all_params / all_opt_states
-                if i != 0:
+                
+                # Check if the optimizer needs to be changed for the new stage
+                stage_idx = np.searchsorted(stage_boundaries, i, side='right')
+                if stage_idx > current_stage:
+                    current_stage = stage_idx
+                    optimiser_class, n_stage_steps, optimiser_kwargs = optimiser_schedule[stage_idx]
+                    
+                    logger.info(f"Starting stage {stage_idx} with {optimiser_class.__name__} for {n_stage_steps} steps at global step {i}")
+                    
+                    # Create the optimizer object, but do NOT initialize state yet
+                    optimiser = optimiser_class(**optimiser_kwargs)
+                    optimiser_fn = optimiser.update
+                    
+                # First merge latest PARAMS ONLY from the previous step
+                if i != 0 and active_params is not None:
                     all_params["trainable"] = merge_active(active_params, all_params["trainable"])
-                    all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
+                    # DO NOT MERGE OPTIMIZER STATE
 
-                # then get new inputs to update step
-                active, merge_active, active_opt_states, active_params, fixed_params, static_params, takess, constraints, x_batch = \
-                     self._get_update_inputs(i, active, all_params, all_opt_states, x_batch_global, constraints_global, constraint_fs_global, constraint_offsets_global, decomposition, problem)
+                # Then get new inputs to update step, passing None for opt_states
+                # as we will create it fresh.
+                active, merge_active, active_params, fixed_params, static_params, takess, constraints, x_batch = \
+                    self._get_update_inputs(i, active, all_params, x_batch_global, constraints_global, constraint_fs_global, constraint_offsets_global, decomposition, problem)
 
-                # AOT compile update function
+                # >>> THIS IS THE CORE FIX <<<
+                # Re-initialize the optimizer state using the NEW active_params
+                logger.info(f"[i: {i}/{self.c.n_steps}] Initialising new state.")
+                active_opt_states = optimiser.init(active_params)
+
+                # AOT compile update function with the new, valid state
                 startc = time.time()
                 logger.info(f"[i: {i}/{self.c.n_steps}] Compiling update step..")
                 static_params_dynamic, static_params_static = partition(static_params)
                 update = FBPINN_update.lower(optimiser_fn, active_opt_states,
-                                             active_params, fixed_params, static_params_dynamic, static_params_static,
-                                             takess, constraints, model_fns, jmapss, loss_fn).compile()
+                                                active_params, fixed_params, static_params_dynamic, static_params_static,
+                                                takess, constraints, model_fns, jmapss, loss_fn).compile()
                 logger.info(f"[i: {i}/{self.c.n_steps}] Compiling done ({time.time()-startc:.2f} s)")
                 p,f = total_size(active_params["network"]), flops_cost_analysis(update.cost_analysis())
                 logger.debug("p, f")
@@ -657,10 +705,11 @@ class FBPINNTrainer(_Trainer):
 
             # report initial model
             if i == 0:
-                u_test_losses, start1, report_time = \
-                self._report(i, pstep, fstep, u_test_losses, start0, start1, report_time,
-                            u_exact, x_batch_test, test_inputs, all_params, all_opt_states, model_fns, problem, decomposition,
-                            active, merge_active, active_opt_states, active_params, x_batch,
+                # u_test_losses, start1, report_time = \
+                    
+                self._report(i, pstep, fstep, train_loss_history, test_error_history, start0, start1, report_time,
+                            u_exact, x_batch_test, test_inputs, all_params, model_fns, problem, decomposition,
+                            active, merge_active, active_params, x_batch,
                             lossval)
 
             # take a training step
@@ -670,10 +719,13 @@ class FBPINNTrainer(_Trainer):
             pstep, fstep = pstep+p, fstep+f
 
             # report
-            u_test_losses, start1, report_time = \
-            self._report(i + 1, pstep, fstep, u_test_losses, start0, start1, report_time,
-                        u_exact, x_batch_test, test_inputs, all_params, all_opt_states, model_fns, problem, decomposition,
-                        active, merge_active, active_opt_states, active_params, x_batch,
+            # u_test_losses, start1, report_time = \
+            if lossval is not None:
+                train_loss_history.append((i + 1, lossval.item(), optimiser_schedule[current_stage][0].__name__))
+                
+            self._report(i + 1, pstep, fstep, train_loss_history, test_error_history, start0, start1, report_time,
+                        u_exact, x_batch_test, test_inputs, all_params, model_fns, problem, decomposition,
+                        active, merge_active, active_params, x_batch,
                         lossval)
 
         # cleanup
@@ -682,13 +734,13 @@ class FBPINNTrainer(_Trainer):
 
         # return trained parameters
         all_params["trainable"] = merge_active(active_params, all_params["trainable"])
-        all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
+        # all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
 
         return all_params
 
-    def _report(self, i, pstep, fstep, u_test_losses, start0, start1, report_time,
-                u_exact, x_batch_test, test_inputs, all_params, all_opt_states, model_fns, problem, decomposition,
-                active, merge_active, active_opt_states, active_params, x_batch,
+    def _report(self, i, pstep, fstep, train_loss_history, test_error_history, start0, start1, report_time,
+                u_exact, x_batch_test, test_inputs, all_params, model_fns, problem, decomposition,
+                active, merge_active, active_params, x_batch,
                 lossval):
         "Report results"
 
@@ -709,22 +761,22 @@ class FBPINNTrainer(_Trainer):
 
                 # merge latest all_params / all_opt_states
                 all_params["trainable"] = merge_active(active_params, all_params["trainable"])
-                all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
+                # all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
 
                 # take test step
                 if test_:
                     u_test_losses = self._test(
-                        x_batch_test, u_exact, u_test_losses, x_batch, test_inputs, i, pstep, fstep, start0, active, all_params, model_fns, problem, decomposition)
+                        x_batch_test, u_exact, train_loss_history, test_error_history, x_batch, test_inputs, i, pstep, fstep, start0, active, all_params, model_fns, problem, decomposition)
 
                 # save model
-                if model_save_:
-                    self._save_model(i, (i, all_params, all_opt_states, active, jnp.array(u_test_losses)))
+                # if model_save_:
+                #     self._save_model(i, (i, all_params, all_opt_states, active, jnp.array(u_test_losses)))
 
                 report_time += time.time()-start2
 
-        return u_test_losses, start1, report_time
+        return start1, report_time
 
-    def _test(self, x_batch_test, u_exact, u_test_losses, x_batch, test_inputs, i, pstep, fstep, start0, active, all_params, model_fns, problem, decomposition):
+    def _test(self, x_batch_test, u_exact, train_loss_history, test_error_history, x_batch, test_inputs, i, pstep, fstep, start0, active, all_params, model_fns, problem, decomposition):
         "Test step"
 
         c, writer = self.c, self.writer
@@ -759,20 +811,27 @@ class FBPINNTrainer(_Trainer):
             us_test, ws_test, us_raw_test = us_test_, ws_test_, us_raw_test_
 
         # get losses over test data
-        l1 = jnp.mean(jnp.abs(u_exact-u_test)).item()
-        l1n = l1 / u_exact.std().item()
-        u_test_losses.append([i, pstep, fstep, time.time()-start0, l1, l1n])
-        writer.add_scalar("loss/test/l1_istep", l1, i)
+        # l1 = jnp.mean(jnp.abs(u_exact-u_test)).item()
+        # l1n = l1 / u_exact.std().item()
+        # u_test_losses.append([i, pstep, fstep, time.time()-start0, l1, l1n])
+        
+        l2_rel_err = jnp.linalg.norm(u_exact - u_test) / jnp.linalg.norm(u_exact)
+        test_error_history.append((i, l2_rel_err.item(), self.c.optimiser_schedule[self._get_current_stage(i-1)][0].__name__))
+        
+        # writer.add_scalar("loss/test/l1_istep", l1, i)
+        
+        writer.add_scalar("loss/test/l2_rel_err_istep", l2_rel_err, i)
 
         # create figures
         if i % (c.test_freq * 5) == 0:
             fs = plot_trainer.plot("FBPINN", all_params["static"]["problem"]["dims"],
-                x_batch_test, u_exact, u_test, us_test, ws_test, us_raw_test, x_batch, all_params, i, active, decomposition, n_test)
+                x_batch_test, u_exact, u_test, us_test, ws_test, us_raw_test, x_batch, all_params, i, active, decomposition, n_test,
+                train_loss_history=train_loss_history, test_error_history=test_error_history)
             if fs is not None:
                 self._save_figs(i, fs)
 
-        return u_test_losses
-
+        # return u_test_losses
+        return None
 
 
 
@@ -966,15 +1025,3 @@ if __name__ == "__main__":
     print(all_params["static"]["problem"])
     if "problem" in all_params["trainable"]:
         print(all_params["trainable"]["problem"])
-
-
-
-
-
-
-
-
-
-
-
-

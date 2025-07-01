@@ -29,7 +29,7 @@ def submit(runs):
         print(f"submitting job {i+1} of {len(runs)}..")
         # save constants and submit sbatch job
         c.get_outdirs()
-        c.save_constants_file()
+        # c.save_constants_file()
         o = subprocess.run(["bash", "run.sh", f"{i}", c.constants_file, trainer],
                            check=False, capture_output=True)
         print(o.stdout.decode())

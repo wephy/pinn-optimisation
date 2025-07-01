@@ -17,11 +17,12 @@ _plotters = {
         },
     }
 
-def plot(trainer, dims, *args):
+def plot(trainer, dims, *args, **kwargs):
     "Plots FBPINN and PINN results"
 
     nx = dims[1]
     if trainer in _plotters and nx in _plotters[trainer]:
-        return _plotters[trainer][nx](*args)
+        # Pass along both positional and keyword arguments
+        return _plotters[trainer][nx](*args, **kwargs)
     else:
-        return ()# TODO: add higher-dim plots
+        return ()
