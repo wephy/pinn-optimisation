@@ -62,14 +62,19 @@ class Constants(ConstantsBase):
         self.network_init_kwargs = dict(
             layer_sizes=[1, 32, 1],
             )
-
-        # Define subdomain scheduler
-        self.scheduler = schedulers.AllActiveSchedulerND
-        self.scheduler_kwargs = dict()
-        #self.scheduler = schedulers.PointSchedulerRectangularND
-        #self.scheduler_kwargs = dict(
-        #    point=np.array([0.]),
-        #    )
+        
+        # Define training schedule
+        self.training_schedule = [
+            [
+                (schedulers.AllActiveSchedulerND, dict()),
+                (optax.adam, 10000, dict(learning_rate=1e-3))
+            ],
+            # Example of a second stage with a different scheduler and optimizer
+            # [
+            #     (schedulers.RandomSubdomainScheduler, dict(steps_per_subdomain=100)),
+            #     (lbfgs, 10000, dict()) # Note: L-BFGS requires a different update function
+            # ]
+        ]
 
         # Define optimisation parameters
         self.ns = ((60,),)# batch_shape for each training constraint
@@ -77,37 +82,21 @@ class Constants(ConstantsBase):
         self.sampler = "grid"# JAX uniform sampler is recommended for on-the-fly generation
         self.seed = 0
 
-        # self.n_batches = 1 # Deprecated when resample_every_step is True
-        # self.resample_every_step = False # If True, generates new collocation points at each training step.
-        # self.resample_frequency = 1e10 # Set how often to resample points (e.g., 1 = every step, 50 = every 50 steps).
-
         # Define summary output parameters
-        self.summary_freq    = 1000# outputs train stats to command line
+        self.summary_freq    = 100# outputs train stats to command line
         self.test_freq       = 1000# outputs test stats to plot / file / command line
-        self.model_save_freq = 10000
+        self.model_save_freq = 1e10
         self.show_figures = True# whether to show figures
         self.save_figures = False# whether to save figures
-        self.clear_output = False# whether to clear ipython output periodically
+        self.clear_output = True# whether to clear ipython output periodically
 
         # other constants
         self.hostname = socket.gethostname().lower()
-
-        # --- NEW: Optimiser Schedule ---
-        # Format: [(optimiser_class, num_steps, kwargs_dict), ...]
-        self.optimiser_schedule = [
-            (optax.adam, 15000, dict(learning_rate=1e-3)),
-            ]
         
-        # Total number of steps is derived from the schedule
-        self.n_steps = sum(item[1] for item in self.optimiser_schedule)
-
-
         # overwrite with input arguments
         for key in kwargs.keys(): self[key] = kwargs[key]# invokes __setitem__ in ConstantsBase
         
-        # Recalculate n_steps if schedule was overwritten
-        if "optimiser_schedule" in kwargs:
-            self.n_steps = sum(item[1] for item in self.optimiser_schedule)
+        self.n_steps = sum(stage[1][1] for stage in self.training_schedule)
 
 
 if __name__ == "__main__":

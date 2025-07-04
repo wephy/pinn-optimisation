@@ -1,131 +1,155 @@
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
-import optax
+from jax.tree_util import tree_leaves, tree_map, tree_unflatten
+
+from functools import partial
+
 from typing import NamedTuple, Callable, Any, Optional
+from typing import Any, Callable, NamedTuple
 
-# ----------------------------------------------------------------------------
-# 1. Define the Optimizer State
-# ----------------------------------------------------------------------------
-# The state now includes the current damping factor `mu`, which will be
-# adapted at each step based on the success of the previous step.
-class AdaptiveNewtonState(NamedTuple):
-    """State for the adaptive Newton optimizer."""
-    count: jnp.ndarray
-    mu: jnp.ndarray  # The adaptive damping factor (trust-region radius)
+import optax
 
-# ----------------------------------------------------------------------------
-# 2. Optimizer "Factory" Function
-# ----------------------------------------------------------------------------
-def adaptive_newton_method(
-    learning_rate: float = 1.0,
-    initial_damping: float = 1e-4,
-    min_damping: float = 1e-6,
-    damping_increase_factor: float = 2.0,
-    damping_decrease_factor: float = 3.0,
-    min_gain_ratio: float = 1e-3,
-    max_update_norm: Optional[float] = 1000.0
-) -> optax.GradientTransformation:
+
+class gaussnewton_lsqr:
     """
-    A robust trust-region style Newton method with adaptive damping.
-
-    This optimizer calculates a proposed Newton step and only accepts it if it
-    actually improves the loss function. If a step is rejected, the damping
-    is increased, making the next step smaller and more cautious.
-
-    Args:
-        learning_rate: Step-size scaling factor for the Newton direction.
-        initial_damping: The starting value for the adaptive damping term.
-        min_damping: The minimum value for the damping term.
-        damping_increase_factor: Factor to increase damping on bad steps.
-        damping_decrease_factor: Factor to decrease damping on good steps.
-        min_gain_ratio: The minimum ratio of actual_reduction/predicted_reduction
-                        for a step to be considered successful.
-        max_update_norm: The maximum allowed L2 norm for the update.
-
-    Returns:
-        An optax.GradientTransformation object.
+    A JAX-based implementation of the Gauss-Newton algorithm using jax.numpy.linalg.lsqr
+    to solve the linear subproblem at each iteration.
     """
 
-    def init_fn(params: optax.Params) -> AdaptiveNewtonState:
-        """Initialises the optimiser state."""
-        return AdaptiveNewtonState(
-            count=jnp.zeros([], jnp.int32),
-            mu=jnp.asarray(initial_damping, dtype=jnp.float32)
-        )
+    def __init__(self, damping_factor: float = 1e-7, lsqr_iter_lim: int = -1):
+        """
+        Initializes the Gauss-Newton optimizer.
 
-    def update_fn(
-        grads: optax.Updates,
-        state: AdaptiveNewtonState,
+        Args:
+            damping_factor (float, optional): Regularization factor for LSQR. Defaults to 1e-8.
+            lsqr_iter_lim (int, optional): Iteration limit for LSQR. Defaults to -1 (auto).
+        """
+        self.damping_factor = damping_factor
+        self.lsqr_iter_lim = lsqr_iter_lim
+
+    def init(self, params: Any) -> None:
+        """Initializes the optimizer state (stateless for this implementation)."""
+        return None
+
+    def update(
+        self,
+        state: Any,  # The state from the base optimizer
         params: optax.Params,
-        *,
-        value: float,
-        value_fn: Callable[[optax.Params], Any],
-        **extra_kwargs
-    ) -> tuple[optax.Updates, AdaptiveNewtonState]:
-        """Performs the Newton update step with an accept/reject mechanism."""
-        if value_fn is None or value is None:
-            raise ValueError("This optimizer requires `value_fn` and the current `value` (loss).")
+        residual_fn: Callable[[optax.Params], float]
+    ) -> tuple[float, Any, Any]:
+        """
+        Performs one step of the Gauss-Newton optimization.
+        This optimizer requires `residual_fn` to be passed.
+        """
+        if residual_fn is None:
+            raise ValueError(
+                "GaussNewtonLSQR requires a 'residual_fn' to be provided to the update method.")
 
-        # Flatten parameters and gradients into single vectors
-        params_flat, unravel_fn = ravel_pytree(params)
-        grads_flat, _ = ravel_pytree(grads)
+        residuals, jacobian_vjp = jax.vjp(residual_fn, params)
+        flat_params, tree_def = jax.tree_util.tree_flatten(params)
+        if not flat_params:
+            raise ValueError("The model has no trainable parameters.")
 
-        def flat_value_fn(p_flat):
-            return value_fn(unravel_fn(p_flat))
+        def jvp(v_flat):
+            v_tree = tree_unflatten(tree_def, v_flat)
+            _, tangent = jax.jvp(residual_fn, (params,), (v_tree,))
+            return tangent
 
-        # --- Calculate Proposed Step ---
-        hessian_matrix = jax.hessian(flat_value_fn)(params_flat)
-        num_params = params_flat.shape[0]
-        
-        # Damp the hessian: H' = H + mu * I
-        hessian_damped = hessian_matrix + state.mu * jnp.eye(num_params)
-        
-        # Solve for the proposed update direction `p`
-        # Using Cholesky solve is more stable for positive-definite systems
-        try:
-            L = jax.scipy.linalg.cholesky(hessian_damped, lower=True)
-            p_flat = -jax.scipy.linalg.cho_solve((L, True), grads_flat)
-        except jnp.linalg.LinAlgError:
-            # Fallback to standard solve if Cholesky fails (not positive-definite)
-            p_flat = -jnp.linalg.solve(hessian_damped, grads_flat)
+        def vjp_lin(v):
+            param_grads_tree = jacobian_vjp(v)[0]
+            flat_grad, _ = jax.tree_util.tree_flatten(param_grads_tree)
+            return jnp.concatenate([g.ravel() for g in flat_grad])
 
-        # --- Evaluate the Quality of the Proposed Step ---
-        # Predicted reduction in loss from the quadratic model: m(0) - m(p)
-        predicted_reduction = - (jnp.dot(grads_flat, p_flat) + 0.5 * jnp.dot(p_flat, hessian_matrix @ p_flat))
-        
-        # Actual reduction in loss: f(x) - f(x+p)
-        proposed_params = unravel_fn(params_flat + p_flat)
-        loss_after_step = value_fn(proposed_params)
-        actual_reduction = value - loss_after_step
-
-        # Gain ratio: rho = actual_reduction / predicted_reduction
-        gain_ratio = actual_reduction / (predicted_reduction + 1e-8)
-
-        # --- Accept or Reject the Step ---
-        is_step_successful = jnp.logical_and(actual_reduction > 0, gain_ratio > min_gain_ratio)
-
-        # If the step is successful, use the proposed update `p`. Otherwise, use zero.
-        final_updates_flat = jnp.where(is_step_successful, p_flat, jnp.zeros_like(p_flat))
-        
-        # Scale by learning rate and clip norm
-        final_updates_flat = learning_rate * final_updates_flat
-        if max_update_norm is not None:
-            update_norm = jnp.linalg.norm(final_updates_flat)
-            scale_factor = jnp.minimum(1.0, max_update_norm / (update_norm + 1e-8))
-            final_updates_flat = final_updates_flat * scale_factor
-        
-        final_updates = unravel_fn(jnp.nan_to_num(final_updates_flat))
-
-        # --- Adapt Damping for Next Iteration ---
-        # If successful, decrease damping (be more aggressive).
-        # If unsuccessful, increase damping (be more cautious).
-        new_mu = jnp.where(
-            is_step_successful,
-            jnp.maximum(min_damping, state.mu / damping_decrease_factor),
-            state.mu * damping_increase_factor
+        num_vars = sum(p.size for p in flat_params)
+        J_operator = jax.scipy.sparse.linalg.LinearOperator(
+            shape=(residuals.shape[0], num_vars),
+            matvec=jvp,
+            rmatvec=vjp_lin
         )
 
-        return final_updates, AdaptiveNewtonState(count=state.count + 1, mu=new_mu)
+        step_flat, *_ = jnp.linalg.lsqr(
+            J_operator,
+            -residuals,
+            damp=self.damping_factor,
+            iter_lim=self.lsqr_iter_lim if self.lsqr_iter_lim != -1 else 100
+        )
 
-    return optax.GradientTransformation(init_fn, update_fn)
+        step_tree = tree_unflatten(tree_def, step_flat)
+        updates = tree_map(lambda x: -x, step_tree)
+        loss = 0.5 * jnp.sum(residuals**2)
+        return loss, updates, None
+
+
+class adam:
+    """
+    Wrapper for optax.adam
+    """
+
+    def __init__(self, **kwargs):
+        """
+        Initializes the wrapper.
+
+        Args:
+          **kwargs: Keyword arguments to be passed, e.g. `learning_rate'
+        """
+
+        self.base_optimizer = optax.adam(**kwargs)
+        self.init = self.base_optimizer.init
+
+    def update(
+        self,
+        state: Any,  # The state from the base optimizer
+        params: optax.Params,
+        residual_fn: Callable[[optax.Params], float]
+    ) -> tuple[float, Any, Any]:
+        """
+        Performs one full optimization step
+        """
+        def internal_loss_fn(p):
+            residuals = residual_fn(p)
+            return 0.5 * jnp.sum(residuals**2)
+
+        loss, grads = jax.value_and_grad(internal_loss_fn)(params)
+
+        updates, new_optimizer_state = self.base_optimizer.update(
+            grads, state, params)
+        return loss, updates, new_optimizer_state
+
+
+class lbfgs:
+    """
+    Wrapper for optax.lbfgs
+    """
+
+    def __init__(self, **kwargs):
+        """
+        Initializes the wrapper.
+
+        Args:
+          **kwargs: Keyword arguments to be passed to the optax.lbfgs optimizer,
+                    such as `tol`, `max_linesearch_steps`, `use_zoom_linesearch`, etc.
+        """
+
+        self.base_optimizer = optax.lbfgs(**kwargs)
+        self.init = self.base_optimizer.init
+
+    def update(
+        self,
+        state: Any,  # The state from the base optimizer
+        params: optax.Params,
+        residual_fn: Callable[[optax.Params], float]
+    ) -> tuple[float, optax.Updates, Any]:
+        """
+        Performs one full optimization step
+        """
+        def internal_loss_fn(p):
+            residuals = residual_fn(p)
+            return 0.5 * jnp.sum(residuals**2)
+        loss, grads = jax.value_and_grad(internal_loss_fn)(params)
+
+        updates, new_optimizer_state = self.base_optimizer.update(
+            grads, state, params, value=loss, grad=grads, value_fn=internal_loss_fn
+        )
+
+        return loss, updates, new_optimizer_state

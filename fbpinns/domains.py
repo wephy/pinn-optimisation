@@ -33,8 +33,8 @@ class Domain:
 
         # below parameters need to be defined
         static_params = {
-            "xd":None,# dimensionality of x
-            }
+            "xd": None,  # dimensionality of x
+        }
         raise NotImplementedError
 
     @staticmethod
@@ -51,10 +51,8 @@ class Domain:
 
     @staticmethod
     def norm_fn(all_params, x):
-        """"Applies norm function, for a SINGLE point with shape (xd,)"""# note only used for PINNs, FBPINN norm function defined in Decomposition
+        """"Applies norm function, for a SINGLE point with shape (xd,)"""  # note only used for PINNs, FBPINN norm function defined in Decomposition
         raise NotImplementedError
-
-
 
 
 class RectangularDomainND(Domain):
@@ -67,10 +65,10 @@ class RectangularDomainND(Domain):
         xd = len(xmin)
 
         static_params = {
-            "xd":xd,
-            "xmin":jnp.array(xmin),
-            "xmax":jnp.array(xmax),
-            }
+            "xd": xd,
+            "xmin": jnp.array(xmin),
+            "xmax": jnp.array(xmax),
+        }
         return static_params, {}
 
     @staticmethod
@@ -83,19 +81,23 @@ class RectangularDomainND(Domain):
         xmin, xmax = all_params["static"]["domain"]["xmin"], all_params["static"]["domain"]["xmax"]
         xd = all_params["static"]["domain"]["xd"]
 
-        assert len(batch_shapes) == 2*xd# total number of boundaries
+        assert len(batch_shapes) == 2*xd  # total number of boundaries
 
         x_batches = []
         for i in range(xd):
-            ic = jnp.array(list(range(i))+list(range(i+1,xd)), dtype=int)
-            for j,v in enumerate([xmin[i], xmax[i]]):
+            ic = jnp.array(list(range(i))+list(range(i+1, xd)), dtype=int)
+            for j, v in enumerate([xmin[i], xmax[i]]):
                 batch_shape = batch_shapes[2*i+j]
                 if len(ic):
                     xmin_, xmax_ = xmin[ic], xmax[ic]
                     key, subkey = jax.random.split(key)
-                    x_batch_ = RectangularDomainND._rectangle_samplerND(subkey, sampler, xmin_, xmax_, batch_shape)# (n, xd-1)
-                    x_batch = v*jnp.ones((jnp.prod(jnp.array(batch_shape)),xd), dtype=float)
-                    x_batch = x_batch.at[:,ic].set(x_batch_)
+                    x_batch_ = RectangularDomainND._rectangle_samplerND(
+                        # (n, xd-1)
+                        subkey, sampler, xmin_, xmax_, batch_shape)
+                    x_batch = v * \
+                        jnp.ones(
+                            (jnp.prod(jnp.array(batch_shape)), xd), dtype=float)
+                    x_batch = x_batch.at[:, ic].set(x_batch_)
                 else:
                     assert len(batch_shape) == 1
                     x_batch = v*jnp.ones(batch_shape+(1,), dtype=float)
@@ -118,12 +120,14 @@ class RectangularDomainND(Domain):
         xd = len(xmin)
         assert len(batch_shape) == xd
 
-        if not sampler in ["grid", "uniform", "sobol", "halton"]:
+        if not sampler in ["grid", "uniform", "sobol", "halton", "latinhypercube"]:
             raise ValueError("ERROR: unexpected sampler")
 
         if sampler == "grid":
-            xs = [jnp.linspace(xmin, xmax, b) for xmin,xmax,b in zip(xmin, xmax, batch_shape)]
-            xx = jnp.stack(jnp.meshgrid(*xs, indexing="ij"), -1)# (batch_shape, xd)
+            xs = [jnp.linspace(xmin, xmax, b)
+                  for xmin, xmax, b in zip(xmin, xmax, batch_shape)]
+            # (batch_shape, xd)
+            xx = jnp.stack(jnp.meshgrid(*xs, indexing="ij"), -1)
             x_batch = xx.reshape((-1, xd))
         else:
             if sampler == "halton":
@@ -133,14 +137,16 @@ class RectangularDomainND(Domain):
             elif sampler == "sobol":
                 r = scipy.stats.qmc.Sobol(xd)
                 s = r.random(np.prod(batch_shape))
+            elif sampler == "latinhypercube":
+                r = scipy.stats.qmc.LatinHypercube(d=xd)
+                s = r.random(n=np.prod(batch_shape))
             elif sampler == "uniform":
                 s = jax.random.uniform(key, (np.prod(batch_shape), xd))
 
-            xmin, xmax = xmin.reshape((1,-1)), xmax.reshape((1,-1))
+            xmin, xmax = xmin.reshape((1, -1)), xmax.reshape((1, -1))
             x_batch = xmin + (xmax - xmin)*s
 
         return jnp.array(x_batch)
-
 
 
 if __name__ == "__main__":
@@ -149,21 +155,21 @@ if __name__ == "__main__":
 
     key = jax.random.PRNGKey(0)
 
-
     domain = RectangularDomainND
     sampler = "halton"
-
 
     # 1D
 
     xmin, xmax = jnp.array([-1,]), jnp.array([2,])
     batch_shape = (10,)
-    batch_shapes = ((3,),(4,))
+    batch_shapes = ((3,), (4,))
 
     ps_ = domain.init_params(xmin, xmax)
-    all_params = {"static":{"domain":ps_[0]}, "trainable":{"domain":ps_[1]}}
+    all_params = {"static": {"domain": ps_[
+        0]}, "trainable": {"domain": ps_[1]}}
     x_batch = domain.sample_interior(all_params, key, sampler, batch_shape)
-    x_batches = domain.sample_boundaries(all_params, key, sampler, batch_shapes)
+    x_batches = domain.sample_boundaries(
+        all_params, key, sampler, batch_shapes)
 
     plt.figure()
     plt.scatter(x_batch, jnp.zeros_like(x_batch))
@@ -172,21 +178,22 @@ if __name__ == "__main__":
         plt.scatter(x_batch, jnp.zeros_like(x_batch))
     plt.show()
 
-
     # 2D
 
-    xmin, xmax = jnp.array([0,1]), jnp.array([1,2])
-    batch_shape = (10,20)
-    batch_shapes = ((3,),(4,),(5,),(6,))
+    xmin, xmax = jnp.array([0, 1]), jnp.array([1, 2])
+    batch_shape = (10, 20)
+    batch_shapes = ((3,), (4,), (5,), (6,))
 
     ps_ = domain.init_params(xmin, xmax)
-    all_params = {"static":{"domain":ps_[0]}, "trainable":{"domain":ps_[1]}}
+    all_params = {"static": {"domain": ps_[
+        0]}, "trainable": {"domain": ps_[1]}}
     x_batch = domain.sample_interior(all_params, key, sampler, batch_shape)
-    x_batches = domain.sample_boundaries(all_params, key, sampler, batch_shapes)
+    x_batches = domain.sample_boundaries(
+        all_params, key, sampler, batch_shapes)
 
     plt.figure()
-    plt.scatter(x_batch[:,0], x_batch[:,1])
+    plt.scatter(x_batch[:, 0], x_batch[:, 1])
     for x_batch in x_batches:
         print(x_batch.shape)
-        plt.scatter(x_batch[:,0], x_batch[:,1])
+        plt.scatter(x_batch[:, 0], x_batch[:, 1])
     plt.show()

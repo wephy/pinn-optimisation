@@ -49,6 +49,49 @@ class AllActiveSchedulerND(ActiveScheduler):
                 yield None
 
 
+class RandomSubdomainScheduler(ActiveScheduler):
+    """Randomly picks N subdomains to be the active ones for a set number
+    of steps, then switches to another random set. All other subdomains are fixed.
+
+    Args:
+        all_params (dict): The complete parameter dictionary for the model.
+        n_steps (int): The total number of training steps for the schedule.
+        steps_per_subdomain (int): The number of training steps to spend on one
+            set of subdomains before randomly switching to another.
+        n_active (int): The number of subdomains to activate at each switch.
+    """
+
+    def __init__(self, all_params, n_steps, steps_per_subdomain=100, n_active=1):
+        super().__init__(all_params, n_steps)
+        self.steps_per_subdomain = steps_per_subdomain
+        
+        if n_active > self.m:
+            raise ValueError(
+                f"n_active ({n_active}) cannot be greater than the total "
+                f"number of subdomains ({self.m})"
+            )
+        self.n_active = n_active
+
+    def __iter__(self):
+        for i in range(self.n_steps):
+            if i % self.steps_per_subdomain == 0:
+                # Time to pick a new set of N subdomains
+                # Use np.random.choice to select n_active unique indices
+                active_indices = np.random.choice(
+                    self.m, 
+                    size=self.n_active, 
+                    replace=False
+                )
+
+                # Set all subdomains to fixed (2), then activate the chosen ones (1)
+                active = np.full(self.m, 0, dtype=int)
+                active[active_indices] = 1
+                yield active
+            else:
+                yield None
+
+    
+
 class _SubspacePointSchedulerRectangularND(ActiveScheduler):
     "Slowly expands radially outwards from a point in a subspace of a rectangular domain (in x units)"
 
