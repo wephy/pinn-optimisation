@@ -42,3 +42,4 @@ venv/
 
 # Misc
 *.deb
+.bashrc
